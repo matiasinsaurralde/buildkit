@@ -526,6 +526,7 @@ type llbBridgeForwarder struct {
 	*pipe
 	ctrs   map[string]gwclient.Container
 	ctrsMu sync.Mutex
+	sendMu sync.Mutex
 }
 
 func (lbf *llbBridgeForwarder) ResolveImageConfig(ctx context.Context, req *pb.ResolveImageConfigRequest) (*pb.ResolveImageConfigResponse, error) {
@@ -1157,12 +1158,14 @@ func (pio *processIO) Write(f *pb.FdMessage) (err error) {
 }
 
 type outputWriter struct {
+	lbf       *llbBridgeForwarder
 	stream    pb.LLBBridge_ExecProcessServer
 	fd        uint32
 	processID string
 }
 
 func (w *outputWriter) Write(msg []byte) (int, error) {
+	w.lbf.sendMu.Lock()
 	bklog.G(w.stream.Context()).Debugf("|---> File Message %s, fd=%d, %d bytes", w.processID, w.fd, len(msg))
 	err := w.stream.Send(&pb.ExecMessage{
 		ProcessID: w.processID,
@@ -1173,6 +1176,7 @@ func (w *outputWriter) Write(msg []byte) (int, error) {
 			},
 		},
 	})
+	w.lbf.sendMu.Unlock()
 	return len(msg), stack.Enable(err)
 }
 
@@ -1303,6 +1307,7 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 
 				eg.Go(func() error {
 					<-pio.done
+					lbf.sendMu.Lock()
 					bklog.G(ctx).Debugf("|---> Done Message %s", pid)
 					err := srv.Send(&pb.ExecMessage{
 						ProcessID: pid,
@@ -1310,6 +1315,7 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 							Done: &pb.DoneMessage{},
 						},
 					})
+					lbf.sendMu.Unlock()
 					return stack.Enable(err)
 				})
 
@@ -1335,6 +1341,7 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 					if errors.As(err, &exitError) {
 						statusCode = exitError.ExitCode
 					}
+					lbf.sendMu.Lock()
 					bklog.G(ctx).Debugf("|---> Exit Message %s, code=%d, error=%s", pid, statusCode, err)
 					sendErr := srv.Send(&pb.ExecMessage{
 						ProcessID: pid,
@@ -1345,6 +1352,7 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 							},
 						},
 					})
+					lbf.sendMu.Unlock()
 
 					if sendErr != nil && err != nil {
 						return errors.Wrap(sendErr, err.Error())
@@ -1360,6 +1368,7 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 					return stack.Enable(err)
 				})
 
+				lbf.sendMu.Lock()
 				bklog.G(ctx).Debugf("|---> Started Message %s", pid)
 				err = srv.Send(&pb.ExecMessage{
 					ProcessID: pid,
@@ -1367,6 +1376,7 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 						Started: &pb.StartedMessage{},
 					},
 				})
+				lbf.sendMu.Unlock()
 				if err != nil {
 					return stack.Enable(err)
 				}
@@ -1389,6 +1399,7 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 							pio.Done()
 						}()
 						dest := &outputWriter{
+							lbf:       lbf,
 							stream:    srv,
 							fd:        uint32(fd),
 							processID: pid,
@@ -1398,6 +1409,8 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 						if err != nil && !errors.Is(err, io.ErrClosedPipe) {
 							return stack.Enable(err)
 						}
+
+						lbf.sendMu.Lock()
 						// no error so must be EOF
 						bklog.G(ctx).Debugf("|---> File Message %s, fd=%d, EOF", pid, fd)
 						err = srv.Send(&pb.ExecMessage{
@@ -1409,6 +1422,7 @@ func (lbf *llbBridgeForwarder) ExecProcess(srv pb.LLBBridge_ExecProcessServer) e
 								},
 							},
 						})
+						lbf.sendMu.Unlock()
 						return stack.Enable(err)
 					})
 				}
